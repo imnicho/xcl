@@ -11,7 +11,8 @@
 //!   GetResourceSizeBytes, GetResourceBaseAlignmentBytes, GetMipLevelOffsetBytes(plane, mip),
 //!   GetTexelElementOffsetBytes(plane, mip, x, y, slice, sample, bit*), GetTexelCoordinate,
 //!   CopyIntoSubresource(dst, plane, subresource, src, row pitch, slice pitch),
-//!   CopyFromSubresource(dst, plane, subresource, src, row pitch, slice pitch), then 2 more.
+//!   CopyFromSubresource(dst, plane, subresource, a 32-bit value, src, row pitch, slice pitch)
+//!   – one argument more than its counterpart: a retail title passes 0 there –, then 2 more.
 //! * XG_RESOURCE_LAYOUT (0x1B40): size @0, alignment @8, mips @0x10, planes @0x14, planes
 //!   from 0x18, 0x6C8 bytes each (usage @0, size @8, slice size @0x10, alignment @0x20, bytes
 //!   per element @0x28, first mip in the tail @0x2C, mips in the tail @0x30, then 15 mips of
@@ -694,11 +695,23 @@ unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, su
     S_OK
 }
 
-/// the level's place in `src` (the whole resource) → rows of `dst` (`row_pitch` apart)
-unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
+/// the level's place in `src` (the whole resource) → rows of `dst` (`row_pitch` apart). Before
+/// `src` there is a 32-bit argument that CopyIntoSubresource does not have: a retail title
+/// passes 0 (what another value selects is not known – said once, and copied as with 0). Read
+/// without it, the title's source was the row pitch and its row pitch the slice pitch: the rows
+/// of a 512×512 BC7 level went a gigabyte apart, past the title's memory. Rows closer than a
+/// row is long are no call of this (E_INVALIDARG).
+unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, arg: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
+    if (row_pitch as usize) < row {
+        return E_INVALIDARG;
+    }
+    if arg != 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_warn!("XGTextureAddressComputer::CopyFromSubresource: {arg} in the argument before the source (0 from the titles seen) – copied as with 0"));
+    }
     if t.depth > 0 {
         let linear = t.chain.detile_volume(std::slice::from_raw_parts(src.add(at as usize), t.size() as usize), i);
         for (n, from) in linear.chunks_exact(row).enumerate() {
@@ -730,6 +743,44 @@ mod tests {
         d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
         d[0x2C..0x30].copy_from_slice(&layout.to_le_bytes());
         d
+    }
+
+    /// CopyFromSubresource as a retail title calls it, with a 32-bit argument (0) before the
+    /// source that CopyIntoSubresource does not have: the rows CopyIntoSubresource tiled come
+    /// back level by level at the row pitch asked for, nothing is written between or after
+    /// them, and rows closer than a row is long are refused. (BC7 512×512 with its mips, 4KB_S:
+    /// the title's first call. Read as CopyIntoSubresource's arguments, the source is the 0.)
+    #[test]
+    fn copy_from_subresource_takes_an_argument_before_the_source() {
+        type Into = unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        type From = unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT;
+        let d = desc(512, 512, 1, 0, 98, 0x105);
+        let t = Texture::new(&d).unwrap();
+        let s = t.texels().unwrap();
+        assert_eq!((s.chain.levels.len(), s.bpe), (10, 16));
+        unsafe {
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGCreateTextureComputer(d.as_ptr(), &mut c), S_OK);
+            let v = *(c as *const *const usize);
+            let (into, from): (Into, From) = (std::mem::transmute(*v.add(8)), std::mem::transmute(*v.add(9)));
+            let mut resource = vec![0u8; t.size() as usize];
+            for (i, m) in s.chain.levels.iter().enumerate() {
+                let row = m.width * s.bpe as usize;
+                let pitch = row + 48;
+                let rows: Vec<u8> = (0..pitch * m.height).map(|n| (n * 31 + i * 7 + n / 251) as u8).collect();
+                assert_eq!(into(c, resource.as_mut_ptr(), 0, i as u32, rows.as_ptr(), pitch as u32, (pitch * m.height) as u32), S_OK, "level {i}");
+                let mut back = vec![0xEEu8; pitch * m.height + 64];
+                assert_eq!(from(c, back.as_mut_ptr(), 0, i as u32, 0, resource.as_ptr(), pitch as u32, (pitch * m.height) as u32), S_OK, "level {i}");
+                for y in 0..m.height {
+                    assert_eq!(back[y * pitch..][..row], rows[y * pitch..][..row], "level {i} row {y}");
+                }
+                let between = (0..m.height).flat_map(|y| y * pitch + row..((y + 1) * pitch).min(back.len())).chain((m.height - 1) * pitch + row..back.len());
+                assert!(between.into_iter().all(|n| back[n] == 0xEE), "level {i}: bytes outside its rows written");
+                assert_eq!(from(c, back.as_mut_ptr(), 0, i as u32, 0, resource.as_ptr(), row as u32 - 1, 0), E_INVALIDARG, "level {i}: rows closer than a row");
+            }
+            assert_eq!(from(c, std::ptr::null_mut(), 0, 0, 0, resource.as_ptr(), 2048, 0), E_INVALIDARG);
+            assert_eq!(release(c), 0);
+        }
     }
 
     /// As the console's library answers (seen on it): RGBA8 256×256, full chain, 64KB_S.
