@@ -983,6 +983,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (17, l::copy_resource_x as usize),
                 (19, l::resolve_subresource_x as usize),
                 (51, l::clear_depth_stencil_x as usize),
+                (53, l::clear_uav_uint_x as usize),
+                (54, l::clear_uav_float_x as usize),
                 (108, l::resolve_subresource_region_x as usize),
                 (13, b::draw_indexed_instanced as usize),
                 (14, b::dispatch as usize),
@@ -7700,6 +7702,16 @@ mod queue_tests {
     fn newer_layout_maps_dispatch_mesh_to_slot_129_not_128() {
         assert!(NEWER_LIST_SLOTS.contains(&(129, 127)), "DispatchMesh must map to newer slot #129");
         assert!(!NEWER_LIST_SLOTS.iter().any(|&(newer, _)| newer == 128), "newer slot #128 must not map to DispatchMesh");
+    }
+
+    /// The list's ClearUnorderedAccessViewUint / Float (#53 / #54) are XCL's: the two handles a
+    /// title passes are slots of a console heap, which `list_x::clear_uav_handles` turns into the
+    /// PC's (they went to the PC method as they were).
+    #[test]
+    fn the_command_list_hooks_clear_unordered_access_view() {
+        let slots = console_slots(Kind::CommandList);
+        assert!(slots.contains(&(53, super::super::list_x::clear_uav_uint_x as usize)), "#53 ClearUnorderedAccessViewUint");
+        assert!(slots.contains(&(54, super::super::list_x::clear_uav_float_x as usize)), "#54 ClearUnorderedAccessViewFloat");
     }
 }
 

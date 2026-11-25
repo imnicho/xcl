@@ -4180,6 +4180,55 @@ pub(super) unsafe extern "system" fn copy_texture_region_flags_x(this: *mut c_vo
 }
 
 const PC_CLEAR_DEPTH_STENCIL_VIEW: usize = 47;
+const PC_CLEAR_UAV_UINT: usize = 49;
+const PC_CLEAR_UAV_FLOAT: usize = 50;
+
+/// The PC's handles for the view of a ClearUnorderedAccessView. A title names two slots of a
+/// console view heap - its GPU and its CPU handle are both addresses in the heap's memory
+/// (`console_heap`) - where the PC wants the UAV's GPU handle in the heap that is bound and the
+/// UAV's CPU handle: (GPU handle, CPU handle, the GPU handle is in the shared heap). `None`: not
+/// console slots, so PC handles already. `Some(None)`: a slot with no shader-visible place for
+/// its UAV (or a sampler's) - the clear cannot be made.
+fn clear_uav_handles(gpu: u64, cpu: u64) -> Option<Option<(u64, usize, bool)>> {
+    match (super::console_heap::slot(gpu), super::console_heap::slot(cpu)) {
+        (None, None) => None,
+        (Some(g), Some(c)) if !g.sampler && !c.sampler && g.pc_gpu_uav != 0 => Some(Some((g.pc_gpu_uav, c.pc_uav as usize, g.shared_srv != 0))),
+        _ => Some(None),
+    }
+}
+
+/// command list #53 / #54 ClearUnorderedAccessViewUint / Float(GPU handle, CPU handle, resource,
+/// values[4], rects, rect list) (PC #49 / #50). The handles went to the PC as the title gave
+/// them: addresses in a console heap's memory, which the PC took for descriptor handles - a
+/// retail title's first such clear in its world hung the GPU (the driver stopped responding).
+unsafe fn clear_uav_x(this: *mut c_void, pc_slot: usize, gpu: u64, cpu: usize, res: usize, values: *const c_void, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    type F = unsafe extern "system" fn(*mut c_void, u64, usize, usize, *const c_void, u32, *const windows::Win32::Foundation::RECT);
+    let f = pc::<F>(this, pc_slot);
+    match clear_uav_handles(gpu, cpu as u64) {
+        None => f(this, gpu, cpu, res, values, n, rects),
+        Some(Some((pc_gpu, pc_cpu, shared))) => {
+            if shared {
+                // (the shared heap is the one bound, also when the title named no heap)
+                ensure_view_heap(this);
+            }
+            f(this, pc_gpu, pc_cpu, res, values, n, rects)
+        }
+        Some(None) => {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: ClearUnorderedAccessView of a view with no shader-visible UAV (handles {gpu:#x} / {cpu:#x}) - skipped");
+            }
+        }
+    }
+}
+
+pub(super) unsafe extern "system" fn clear_uav_uint_x(this: *mut c_void, gpu: u64, cpu: usize, res: usize, values: *const c_void, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    clear_uav_x(this, PC_CLEAR_UAV_UINT, gpu, cpu, res, values, n, rects)
+}
+
+pub(super) unsafe extern "system" fn clear_uav_float_x(this: *mut c_void, gpu: u64, cpu: usize, res: usize, values: *const c_void, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    clear_uav_x(this, PC_CLEAR_UAV_FLOAT, gpu, cpu, res, values, n, rects)
+}
 
 /// command list #51 ClearDepthStencilView(dsv, flags, depth, stencil, rects, rect list) (PC #47)
 pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, dsv: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const windows::Win32::Foundation::RECT) {
@@ -6909,6 +6958,165 @@ mod tests {
         note_dropped_draw(fake_list);
         let res = LISTS.lock().unwrap().as_mut().unwrap().remove(&(fake_list as usize)).unwrap().occlusion.end((7, 42));
         assert_eq!(res, (true, true));
+    }
+
+    /// ClearUnorderedAccessView names its view by two slots of a console heap: the PC gets the
+    /// UAV's GPU handle and its CPU handle in the PC heap behind them (console slot k: the PC's
+    /// descriptors 2k, its SRV, and 2k + 1, its UAV). Handles that are no console slots are the
+    /// PC's already; a heap that is not shader visible has no GPU handle to clear with, and a
+    /// sampler heap has no views.
+    #[test]
+    fn clear_uav_handles_are_those_of_the_pc_heap_behind_the_slots() {
+        use super::super::console_heap::{register, start, unregister};
+        if crate::gpu::uma::get().is_none() {
+            return println!("SKIPPED clear_uav_handles_are_those_of_the_pc_heap_behind_the_slots: no unified memory");
+        }
+        // views: 4 slots over a PC heap at 0x1000 (increment 32, GPU 0x5000)
+        assert!(register(0xC1EA_0001, 4, 0x1000, 0x5000, 32, false, false, true));
+        let v = start(0xC1EA_0001).unwrap();
+        assert_eq!(clear_uav_handles(v + 32, v + 32), Some(Some((0x5060, 0x1060, false))), "slot 1: the PC's descriptor 3");
+        assert_eq!(clear_uav_handles(v, v + 64), Some(Some((0x5020, 0x10A0, false))), "the GPU handle's slot and the CPU handle's");
+        assert_eq!(clear_uav_handles(0x5060, 0x1060), None, "PC handles stay as they are");
+        assert_eq!(clear_uav_handles(v + 32, 0x1060), Some(None), "a slot and a PC handle are no pair");
+        // not shader visible: no GPU handle
+        assert!(register(0xC1EA_0002, 2, 0x2000, 0, 32, false, false, false));
+        let h = start(0xC1EA_0002).unwrap();
+        assert_eq!(clear_uav_handles(h, h), Some(None));
+        // samplers
+        assert!(register(0xC1EA_0003, 2, 0x9000, 0x9800, 16, true, false, true));
+        let sm = start(0xC1EA_0003).unwrap();
+        assert_eq!(clear_uav_handles(sm, sm), Some(None));
+        for obj in [0xC1EA_0001usize, 0xC1EA_0002, 0xC1EA_0003] {
+            unregister(obj);
+        }
+    }
+
+    /// Real GPU: a title's ClearUnorderedAccessViewUint (#53) and Float (#54) with the handles a
+    /// title has - the addresses of a console heap's slot. The textures hold the values
+    /// afterwards. (The calls went to the PC as they were: it took the addresses for descriptor
+    /// handles, and a retail title's first clear hung the GPU.) The hooks are called as the
+    /// list's slots call them, on the PC list (`real::tests` has the slots).
+    #[test]
+    fn clear_unordered_access_view_takes_the_slots_of_a_console_heap() {
+        use super::super::console_heap::{register, start, unregister};
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC};
+        let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        if crate::gpu::uma::get().is_none() {
+            return crate::gpu::recomp::runner::skip_test("no unified memory");
+        }
+        unsafe {
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            // a view heap of 4 console slots: 8 PC descriptors
+            let heap: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: 8, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 })
+                .unwrap();
+            let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            let (cpu0, gpu0) = (heap.GetCPUDescriptorHandleForHeapStart().ptr, heap.GetGPUDescriptorHandleForHeapStart().ptr);
+            let obj = heap.as_raw() as usize;
+            assert!(register(obj, 4, cpu0 as u64, gpu0, inc, false, false, true));
+            let v = start(obj).unwrap();
+            // two 64x64 textures with their UAVs in slots 1 and 2 (the PC's descriptors 3 and 5)
+            let texture = |format: DXGI_FORMAT, slot: usize| -> ID3D12Resource {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 64,
+                    Height: 64,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None, &mut r).unwrap();
+                let r = r.unwrap();
+                dev.CreateUnorderedAccessView(&r, None, None, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu0 + (2 * slot + 1) * inc as usize });
+                r
+            };
+            let (uint, float) = (texture(DXGI_FORMAT_R32_UINT, 1), texture(DXGI_FORMAT_R32_FLOAT, 2));
+
+            // the title's list: its heap bound, then the two clears through its slots #53 and #54
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let pc_list = dev.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(0, ty, &alloc, None).unwrap().into_raw();
+            real::adopt(pc_list, real::Kind::CommandList);
+            on_create(pc_list, alloc.as_raw() as usize, 0, ty);
+            super::super::bind::reset(pc_list, alloc.as_raw() as usize, 0);
+            let list = super::super::title_list::wrap(pc_list);
+            let slot = |i: usize| *(*(list as *const *const usize)).add(i);
+            let heaps = [obj];
+            set_descriptor_heaps_x(pc_list, 1, heaps.as_ptr());
+            let (uints, floats) = ([0x1234_5678u32, 0, 0, 0], [1.5f32, 0.0, 0.0, 0.0]);
+            clear_uav_uint_x(pc_list, v + 32, (v + 32) as usize, uint.as_raw() as usize, uints.as_ptr() as *const c_void, 0, std::ptr::null());
+            clear_uav_float_x(pc_list, v + 64, (v + 64) as usize, float.as_raw() as usize, floats.as_ptr() as *const c_void, 0, std::ptr::null());
+            let close: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(slot(9));
+            assert_eq!(close(list), 0);
+            // submitted as ExecuteCommandLists does: the PC lists the title's list stands for
+            let mut segs = Vec::new();
+            assert!(super::super::title_list::push_segments(list, &mut segs));
+            let exec: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) = std::mem::transmute(*(*(q.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
+            exec(q.as_raw(), segs.len() as u32, segs.as_ptr());
+            super::super::alloc_pool::executed(q.as_raw(), &segs);
+            q.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("the clears finish");
+
+            // what the textures hold now (a PC list of the test's own)
+            let read = |r: &ID3D12Resource, k: u64| -> Vec<u32> {
+                let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                let mut total = 0u64;
+                dev.GetCopyableFootprints(&r.GetDesc(), 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+                let buffer = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: total,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut rb: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+                let rb = rb.unwrap();
+                let a: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+                let l: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &a, None).unwrap();
+                let barrier = |before, after| D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(r), Subresource: 0, StateBefore: before, StateAfter: after }),
+                    },
+                };
+                l.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+                l.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                l.Close().unwrap();
+                q.ExecuteCommandLists(&[Some(l.cast().unwrap())]);
+                q.Signal(&done, k).unwrap();
+                crate::gpu::fence::wait(&done, k, &dev, None, 5000).expect("the copy back finishes");
+                let mut p = std::ptr::null_mut();
+                rb.Map(0, None, Some(&mut p)).unwrap();
+                let mut out = Vec::with_capacity(64 * 64);
+                for y in 0..64usize {
+                    out.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(y * fp.Footprint.RowPitch as usize) as *const u32, 64));
+                }
+                rb.Unmap(0, None);
+                out
+            };
+            let (got_uint, got_float) = (read(&uint, 2), read(&float, 3));
+            let removed = dev.GetDeviceRemovedReason();
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slot(2));
+            release(list);
+            unregister(obj);
+            assert!(removed.is_ok(), "the device is there: {removed:?}");
+            assert!(got_uint.iter().all(|&x| x == 0x1234_5678), "#53 cleared the texture its slot names: first texel {:#x}", got_uint[0]);
+            assert!(got_float.iter().all(|&x| x == 1.5f32.to_bits()), "#54 cleared the texture its slot names: first texel {:#x}", got_float[0]);
+        }
     }
 
     #[test]
