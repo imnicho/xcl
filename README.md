@@ -244,6 +244,13 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   can still differ there. With `XCL_DIRECT_DXIL=1` and `XCL_PER_LANE=1`, compute groups
   made up of complete native waves can use the per-lane form for branches on whole-wave masks.
   Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
+- **Drive space:** a run writes to XCL's data folder (`XCL_DATA_ROOT`), to XCL's shader cache
+  (`XCL_DXIL_CACHE`) and, through the GPU driver, to the driver's own shader cache, which stays on the
+  drive of your user profile wherever the other two are (NVIDIA: `%LOCALAPPDATA%\NVIDIA\DXCache`).
+  That one grows with every pipeline a title makes: on an RTX 5080 (driver 610.47) the files of
+  `xcl.exe` there reached 34.6 GB in two days of runs of a retail title and filled the drive in the
+  middle of a run. "Shader Cache Size" in the NVIDIA Control Panel (Manage 3D settings) caps it.
+  `xcl run` prints a warning for each of these drives that has under 4 GB free.
 
 ```powershell
 cargo build --release --workspace          # target\release\xcl.exe
